@@ -1,0 +1,145 @@
+--- a/cli.py
++++ b/cli.py
+@@ -35,8 +35,9 @@
+ from .horizons import HorizonMetadataError, monthly_horizon_steps
+ from .limits import ParseLimits
+ from .targets import log_return_steps
++from . import fhs
+ 
+-DEFAULT_DRAWS = 500
++DEFAULT_DRAWS = 2000
+ _RATIONALE_NAME = "forecast_rationale.md"
+ 
+ 
+@@ -222,6 +223,21 @@
+     return out
+ 
+ 
++def _dense_recent(hist: dict[str, pd.Series], asof: str) -> bool:
++    """True when every asset has dense daily history right up to the as-of.
++
++    Transfer cards (target withheld for years, single row at the as-of) and anything sparse go
++    to the reference walk, which already handles those shapes and passes the gates."""
++    cut = pd.Timestamp(asof) - pd.Timedelta(days=730)
++    for s in hist.values():
++        idx = pd.to_datetime(pd.Index(s.index).astype(str).str.slice(0, 10))
++        if len(idx) < 400 or (idx > cut).sum() < 400:
++            return False
++        if (pd.Timestamp(asof) - idx.max()).days > 10:
++            return False
++    return True
++
++
+ def _draw(
+     panels: dict[str, pd.DataFrame],
+     assets: list[str],
+@@ -245,6 +261,15 @@
+     hist = {a: _series(panels, a, asof) for a in assets}
+     returns_target = target_type == "log_return"
+     monthly = panel_steps is not None
++    if not monthly and _dense_recent(hist, asof):
++        try:
++            out_fhs, fstats = fhs.simulate(
++                hist, assets, horizons, target_type, n_draws, seed, fhs.TUNED
++            )
++            if np.isfinite(out_fhs).all():
++                return out_fhs, {**fstats, "engine": "fhs", "target_type": target_type}
++        except Exception as exc:  # any failure falls back to the gate-proven reference walk
++            warnings.warn(f"FHS engine failed ({exc!r}); using reference walk", stacklevel=2)
+     if monthly:
+         panel_steps = np.asarray(panel_steps, dtype=float)
+         if (
+@@ -448,6 +473,60 @@
+ """
+ 
+ 
++def _rationale_fhs(
++    unit_id: str,
++    asof: str,
++    assets: list[str],
++    horizons: list[int],
++    n_draws: int,
++    stats: dict[str, Any],
++    text_dir: pathlib.Path,
++) -> str:
++    n_docs = len(list(text_dir.glob("*.txt"))) if text_dir.is_dir() else 0
++    rows = "\n".join(
++        f"| {x} | {stats['anchor'][x]:.6g} | {stats['cur_sd'][x]:.4g} | {stats['lr_sd'][x]:.4g} | "
++        f"{stats['drift'][x]:.3g} |"
++        for x in assets
++    )
++    p = stats["params"]
++    return f"""# Forecast rationale — {unit_id}
++
++As of **{asof}**: joint draws for {", ".join(assets)} at horizon(s)
++{", ".join(str(h) for h in horizons)} business days. {n_draws} draws.
++
++## Method (text-blind statistical engine)
++
++Filtered historical simulation, using only panel rows at or before the as-of:
++
++1. Daily steps (first differences for levels; log(1+r) for return targets). Steps that span a
++   data gap are dropped.
++2. The current variance is an EWMA (lambda {p['lam']}). It mean-reverts towards the long-run
++   variance (last {p['lr_window']} steps) at {p['phi']} per day over the horizon.
++3. Innovations are {p['block']}-day block bootstraps of whole-date standardised residual vectors.
++   Fat tails and cross-asset correlation come from the data, not from a Gaussian assumption.
++4. A per-draw common volatility multiplier (log-sd {p['volvol']}) carries parameter uncertainty.
++   The global width factor is {p['scale']}.
++5. Every horizon is read off the same simulated path, so cross-horizon dependence is coherent.
++
++| asset | anchor | current daily sd | long-run daily sd | daily drift |
++|---|---|---|---|---|
++{rows}
++
++Centre: the anchor is the last observation for levels, with no drift
++(fraction {p['level_drift']} of trailing mean). For return targets, the anchor is zero plus
++{p['ret_drift_shrink']} × the long-run mean log return per day.
++
++## What the text corpus contributed
++
++Nothing. {n_docs} document(s) were present and none was read. This entry is a calibrated
++statistical forecaster; no adjustment was inferred from tone or from memory of later events.
++
++## What would change this forecast
++
++A change in recent realised volatility (moves the width through the EWMA), or new panel data.
++"""
++
++
+ def main(argv: list[str] | None = None) -> int:
+     p = argparse.ArgumentParser(
+         prog="forecast",
+@@ -522,6 +601,12 @@
+         panel_steps=panel_steps,
+     )
+ 
++    fhs_engine = stats.get("engine") == "fhs"
++    method = (
++        "filtered historical simulation (EWMA-filtered block bootstrap, vol mean-reversion), no text"
++        if fhs_engine
++        else "joint gaussian random walk, no text"
++    )
+     out_dir = a.out.parent
+     out_dir.mkdir(parents=True, exist_ok=True)
+     pd.DataFrame(
+@@ -545,7 +630,7 @@
+                 "target": tgt.get("target_type", "level"),
+                 "rationale": {
+                     "file": _RATIONALE_NAME,
+-                    "method": "joint gaussian random walk, no text",
++                    "method": method,
+                 },
+             },
+             indent=2,
+@@ -554,7 +639,9 @@
+     )
+ 
+     (out_dir / _RATIONALE_NAME).write_text(
+-        _rationale(unit_id, a.asof, assets, horizons, n_draws, stats, a.text)
++        _rationale_fhs(unit_id, a.asof, assets, horizons, n_draws, stats, a.text)
++        if fhs_engine
++        else _rationale(unit_id, a.asof, assets, horizons, n_draws, stats, a.text)
+     )
+ 
+     print(f"wrote {a.out.name}, forecast_meta.json and {_RATIONALE_NAME} to {out_dir}")
