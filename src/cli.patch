@@ -4,14 +4,75 @@
  from .horizons import HorizonMetadataError, monthly_horizon_steps
  from .limits import ParseLimits
  from .targets import log_return_steps
-+from . import fhs
++from . import fhs, release
  
 -DEFAULT_DRAWS = 500
 +DEFAULT_DRAWS = 2000
  _RATIONALE_NAME = "forecast_rationale.md"
  
  
-@@ -222,6 +223,21 @@
+@@ -98,6 +99,16 @@
+         sub = sub[sub["date"] <= asof].sort_values("date")
+         if not sub.empty:
+             return sub.set_index("date")["value"].astype(float)
++    want = _norm_name(asset)
++    for df in panels.values():
++        col = _asset_col(df)
++        if col is None:
++            continue
++        names = {str(v) for v in df[col].unique()}
++        hit = [n for n in names if _norm_name(n) == want]
++        if len(hit) == 1:
++            warnings.warn(f"asset {asset!r} matched panel name {hit[0]!r}", stacklevel=2)
++            return _series(panels, hit[0], asof)
+     seen = sorted(
+         {
+             str(v)
+@@ -112,6 +123,43 @@
+     )
+ 
+ 
++def _norm_name(x: str) -> str:
++    """Case/punctuation-insensitive asset key (UST_3M == ust-3m == UST3M)."""
++    return "".join(ch for ch in str(x).upper() if ch.isalnum())
++
++
++#: Horizons at or below this many business days use the short-horizon FHS parameters and the
++#: relaxed density rule (Final ranked cards: 1-4 business days).
++SHORT_MAX_H = 10
++
++
++def _dense_recent_short(hist: dict[str, pd.Series], asof: str) -> bool:
++    """Short-horizon rule: >= 100 daily rows in the last 400 days and fresh at the as-of."""
++    cut = pd.Timestamp(asof) - pd.Timedelta(days=400)
++    for s in hist.values():
++        idx = pd.to_datetime(pd.Index(s.index).astype(str).str.slice(0, 10))
++        if (idx > cut).sum() < 100 or (pd.Timestamp(asof) - idx.max()).days > 10:
++            return False
++        if release.median_gap_days(s) > 4:
++            return False
++    return True
++
++
++def _release_k(hist: dict[str, pd.Series], assets: list[str], horizons: list[int]) -> np.ndarray:
++    """New prints per (asset, horizon): one per release inside a short window, else calendar-scaled."""
++    k = np.ones((len(assets), len(horizons)))
++    for i, a in enumerate(assets):
++        gap = max(release.median_gap_days(hist[a]), 1.0)
++        for j, h in enumerate(horizons):
++            if gap <= 4:          # daily series riding along on a release card: h business days
++                k[i, j] = max(h, 1)
++            elif max(horizons) <= SHORT_MAX_H:
++                k[i, j] = 1       # the card exists because one print lands in the window
++            else:
++                k[i, j] = max(1, round(h * 7 / 5 / gap))
++    return k
++
++
+ def _monthly_series(s: pd.Series) -> pd.Series:
+     """Align monthly observations by period and refuse ambiguous source cadence."""
+     out = s.copy()
+@@ -222,6 +270,21 @@
      return out
  
  
@@ -33,14 +94,27 @@
  def _draw(
      panels: dict[str, pd.DataFrame],
      assets: list[str],
-@@ -245,6 +261,15 @@
+@@ -245,6 +308,28 @@
      hist = {a: _series(panels, a, asof) for a in assets}
      returns_target = target_type == "log_return"
      monthly = panel_steps is not None
-+    if not monthly and _dense_recent(hist, asof):
++    short = max(horizons) <= SHORT_MAX_H
++    if target_type == "level" and (
++        monthly or any(release.median_gap_days(s) > 4 for s in hist.values())
++    ):
++        try:
++            k = np.asarray(panel_steps, float) if monthly else _release_k(hist, assets, horizons)
++            out_rel, rstats = release.simulate_steps(hist, assets, horizons, k, n_draws, seed)
++            if np.isfinite(out_rel).all():
++                return out_rel, {**rstats, "target_type": target_type}
++        except Exception as exc:
++            warnings.warn(f"release engine failed ({exc!r}); using reference walk", stacklevel=2)
++    dense = _dense_recent_short(hist, asof) if short else _dense_recent(hist, asof)
++    if not monthly and dense:
 +        try:
 +            out_fhs, fstats = fhs.simulate(
-+                hist, assets, horizons, target_type, n_draws, seed, fhs.TUNED
++                hist, assets, horizons, target_type, n_draws, seed,
++                fhs.SHORT if short else fhs.TUNED,
 +            )
 +            if np.isfinite(out_fhs).all():
 +                return out_fhs, {**fstats, "engine": "fhs", "target_type": target_type}
@@ -49,10 +123,47 @@
      if monthly:
          panel_steps = np.asarray(panel_steps, dtype=float)
          if (
-@@ -448,6 +473,60 @@
+@@ -448,6 +533,124 @@
  """
  
  
++def _rationale_simple(unit_id, asof, assets, horizons, n_draws, stats, text_dir) -> str:
++    n_docs = len(list(text_dir.glob("*.txt"))) if text_dir.is_dir() else 0
++    if stats.get("engine") == "release":
++        rows = "\n".join(
++            f"| {x} | {stats['last'][x]:.6g} | {stats['drift_per_print'][x]:.4g} | "
++            f"{stats['sd_per_print'][x]:.4g} | {', '.join(f'{h}:{k}' for h, k in stats['prints'][x].items())} |"
++            for x in assets
++        )
++        body = f"""## Method (text-blind step model for official releases)
++
++The series is published as discrete prints, so the clock is the number of new prints before each
++target date, not business days. The centre is the last print plus that many times the mean of the
++last 12 print-to-print changes. The width per print blends the sd of the last 36 changes (weight
++0.75) with the sd of the last 240. The shape is a smoothed bootstrap of recent standardised changes.
++
++| asset | last print | drift per print | sd per print | horizon:prints |
++|---|---|---|---|---|
++{rows}
++"""
++    else:
++        body = """## Method (fallback)
++
++The primary engines could not use these inputs, so each asset gets a robust walk. The centre is
++the last value (0 for return targets). The scale is a MAD of recent steps with Student-t(5) tails.
++"""
++    return f"""# Forecast rationale — {unit_id}
++
++As of **{asof}**: joint draws for {", ".join(assets)} at horizon(s)
++{", ".join(str(h) for h in horizons)} business days. {n_draws} draws.
++
++{body}
++## What the text corpus contributed
++
++Nothing. {n_docs} document(s) were present and none was read.
++"""
++
++
 +def _rationale_fhs(
 +    unit_id: str,
 +    asof: str,
@@ -107,23 +218,87 @@
 +"""
 +
 +
++def _safe_fallback(panels, assets, horizons, asof, n_draws, seed, target_type):
++    """Per-asset robust walk: last value (0 for returns), MAD-based step scale, step-count clock."""
++    rng = np.random.default_rng(seed)
++    hist = {}
++    for x in assets:
++        try:
++            hist[x] = _series(panels, x, asof)
++        except BaseException:
++            hist[x] = pd.Series(dtype=float)
++    out = np.empty((n_draws, len(assets), len(horizons)))
++    for i, x in enumerate(assets):
++        s = pd.to_numeric(hist[x], errors="coerce").dropna()
++        if target_type == "log_return":
++            st = np.log1p(s.clip(lower=-0.99)).iloc[-500:]
++            centre, unit = 0.0, (1.4826 * float(np.median(np.abs(st - st.median()))) if len(st) > 5 else 0.01)
++        else:
++            st = s.diff().dropna().iloc[-250:]
++            centre = float(s.iloc[-1]) if len(s) else 0.0
++            unit = 1.4826 * float(np.median(np.abs(st - st.median()))) if len(st) > 5 else 0.0
++            unit = unit or (float(st.abs().mean()) if len(st) else 0.0) or max(abs(centre) * 0.01, 1e-3)
++        gap = release.median_gap_days(s) if len(s) > 2 else 1.0
++        for j, h in enumerate(horizons):
++            steps = h if gap <= 4 else (1 if max(horizons) <= SHORT_MAX_H else max(1, round(h * 7 / 5 / gap)))
++            out[:, i, j] = centre + unit * 1.2 * np.sqrt(steps) * rng.standard_t(5, n_draws) * np.sqrt(3 / 5)
++    return out, {"engine": "fallback", "target_type": target_type}
++
++
  def main(argv: list[str] | None = None) -> int:
      p = argparse.ArgumentParser(
          prog="forecast",
-@@ -522,6 +601,12 @@
-         panel_steps=panel_steps,
-     )
+@@ -509,19 +712,37 @@
+     panels = _read_panels(a.panels)
+     try:
+         panel_steps = _monthly_inputs(panels, card, card_path, a.asof)
+-    except HorizonMetadataError as exc:
+-        raise SystemExit(str(exc)) from None
+-    samples, stats = _draw(
+-        panels,
+-        assets,
+-        horizons,
+-        a.asof,
+-        n_draws,
+-        a.seed,
+-        target_type=tgt.get("target_type", "level"),
+-        panel_steps=panel_steps,
+-    )
++    except Exception as exc:  # inconsistent monthly metadata: use the cadence-based step count
++        warnings.warn(f"monthly metadata unusable ({exc}); using cadence step counts", stacklevel=2)
++        panel_steps = None
++    try:
++        samples, stats = _draw(
++            panels,
++            assets,
++            horizons,
++            a.asof,
++            n_draws,
++            a.seed,
++            target_type=tgt.get("target_type", "level"),
++            panel_steps=panel_steps,
++        )
++        if samples.shape != (n_draws, len(assets), len(horizons)) or not np.isfinite(samples).all():
++            raise ValueError("engine returned a malformed sample array")
++    except BaseException as exc:  # last resort: never leave a card without a forecast
++        if isinstance(exc, KeyboardInterrupt):
++            raise
++        warnings.warn(f"primary engines failed ({exc!r}); using safe fallback", stacklevel=2)
++        samples, stats = _safe_fallback(
++            panels, assets, horizons, a.asof, n_draws, a.seed, tgt.get("target_type", "level")
++        )
  
-+    fhs_engine = stats.get("engine") == "fhs"
-+    method = (
-+        "filtered historical simulation (EWMA-filtered block bootstrap, vol mean-reversion), no text"
-+        if fhs_engine
-+        else "joint gaussian random walk, no text"
-+    )
++    engine = stats.get("engine")
++    fhs_engine = engine == "fhs"
++    method = {
++        "fhs": "filtered historical simulation (EWMA-filtered block bootstrap, vol mean-reversion), no text",
++        "release": "per-print step model (recent drift, blended sd, smoothed bootstrap), no text",
++        "fallback": "robust per-asset walk (MAD scale, Student-t), no text",
++    }.get(engine, "joint gaussian random walk, no text")
      out_dir = a.out.parent
      out_dir.mkdir(parents=True, exist_ok=True)
      pd.DataFrame(
-@@ -545,7 +630,7 @@
+@@ -545,7 +766,7 @@
                  "target": tgt.get("target_type", "level"),
                  "rationale": {
                      "file": _RATIONALE_NAME,
@@ -132,13 +307,15 @@
                  },
              },
              indent=2,
-@@ -554,7 +639,9 @@
+@@ -554,7 +775,11 @@
      )
  
      (out_dir / _RATIONALE_NAME).write_text(
 -        _rationale(unit_id, a.asof, assets, horizons, n_draws, stats, a.text)
 +        _rationale_fhs(unit_id, a.asof, assets, horizons, n_draws, stats, a.text)
 +        if fhs_engine
++        else _rationale_simple(unit_id, a.asof, assets, horizons, n_draws, stats, a.text)
++        if engine in ("release", "fallback")
 +        else _rationale(unit_id, a.asof, assets, horizons, n_draws, stats, a.text)
      )
  

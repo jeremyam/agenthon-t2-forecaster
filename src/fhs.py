@@ -37,6 +37,7 @@ class FHSParams:
     ret_drift_shrink: float = 0.5  # fraction of long-run mean log return used as drift
     level_drift: float = 0.0   # fraction of trailing mean level step used as drift
     min_steps: int = 250
+    vol_floor: float = 0.0     # current sd >= vol_floor * long-run sd
 
 
 def _gap_mask(idx: pd.DatetimeIndex) -> np.ndarray:
@@ -94,6 +95,7 @@ def simulate(
     init = X[: min(60, n)].var(axis=0) + 1e-18
     sig2 = np.column_stack([ewma_var(X[:, i], p.lam, init[i]) for i in range(A)])  # (n+1, A)
     cur = p.w_ewma * sig2[-1] + (1 - p.w_ewma) * lr_var
+    cur = np.maximum(cur, (p.vol_floor ** 2) * lr_var)
     Z = X / np.sqrt(sig2[:-1])
     Z = Z[60:][-p.resid_window:]
     Z = Z / Z.std(axis=0)  # unit variance per asset, keeps cross-correlation + tails
@@ -135,3 +137,7 @@ def simulate(
 
 #: Parameters selected on the 2003-2014 development backtest (see /workspace/agenthon/README.md).
 TUNED = FHSParams(lam=0.97, lr_window=1260, phi=0.999, w_ewma=1.0, block=10, resid_window=2520, volvol=0.35, scale=0.9, ret_drift_shrink=0.0, level_drift=0.0, min_steps=250)
+
+#: Short-horizon parameters (Final ranked cards: 1-4 business days), selected on a 2005-2016
+#: rolling backtest of UST incl. bills, G10 and EM FX; checked on 2017-2026 (see README §8).
+SHORT = FHSParams(lam=0.93, lr_window=500, phi=0.99, w_ewma=1.0, block=1, resid_window=2520, volvol=0.15, scale=0.97, ret_drift_shrink=0.0, level_drift=0.0, min_steps=60, vol_floor=0.05)

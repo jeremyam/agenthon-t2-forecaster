@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuilds the runtime package: organizers' MIT reference package at a pinned commit,
-# plus our FHS engine (src/fhs.py) and our CLI changes (src/cli.patch). Hash-checked.
+# plus our FHS engine (src/fhs.py), release engine (src/release.py) and our CLI changes (src/cli.patch). Hash-checked.
 set -euo pipefail
 UPSTREAM_SHA=30c8019d997f930eab9ba569d089d12298d86d8c
 cd "$(dirname "$0")/.."
@@ -9,5 +9,7 @@ curl -fsSL "https://github.com/Agenthon-2026/track2-forecasting-public/archive/$
 cp -r /tmp/upstream/*/qfbench2_track_forecasting ./qfbench2_track_forecasting
 patch qfbench2_track_forecasting/cli.py src/cli.patch
 cp src/fhs.py qfbench2_track_forecasting/fhs.py
-echo "8d2f928f4e5ee9c971caab5a83e7edb7009883a3bbc6b92b6ffbc7bbc368b2d5  qfbench2_track_forecasting/cli.py
-6d04491f49b7c1c23b70844ab75c65bfd1ea1303316b10ee28f02c3aeaf060ff  qfbench2_track_forecasting/fhs.py" | sha256sum -c -
+cp src/release.py qfbench2_track_forecasting/release.py
+echo "9a1ccce82c01edfdaab44d79685eaecd221aab0903aeb452383dc255ca2e3d73  qfbench2_track_forecasting/cli.py
+9c784fc4a9a22ece3f5842e2386b0eb4e6377cdb439224819af8faf4501d6ca0  qfbench2_track_forecasting/fhs.py
+7684aa4b4f3f028c14d2c847dc19336cc7db0ab6824f446d0d5f52f557611b4d  qfbench2_track_forecasting/release.py" | sha256sum -c -
