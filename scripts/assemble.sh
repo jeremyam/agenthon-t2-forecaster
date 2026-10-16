@@ -10,6 +10,6 @@ cp -r /tmp/upstream/*/qfbench2_track_forecasting ./qfbench2_track_forecasting
 patch qfbench2_track_forecasting/cli.py src/cli.patch
 cp src/fhs.py qfbench2_track_forecasting/fhs.py
 cp src/release.py qfbench2_track_forecasting/release.py
-echo "9a1ccce82c01edfdaab44d79685eaecd221aab0903aeb452383dc255ca2e3d73  qfbench2_track_forecasting/cli.py
+echo "7a96adc2492820abaeae23fa5ef95d45c05dd37091e614e691990d26b9ef8593  qfbench2_track_forecasting/cli.py
 9c784fc4a9a22ece3f5842e2386b0eb4e6377cdb439224819af8faf4501d6ca0  qfbench2_track_forecasting/fhs.py
 7684aa4b4f3f028c14d2c847dc19336cc7db0ab6824f446d0d5f52f557611b4d  qfbench2_track_forecasting/release.py" | sha256sum -c -
